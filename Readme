@@ -66,6 +66,11 @@ def random_service():
 
 random_service()
 
+
+
+
+
+
 Random Rules
 Для тестирования были сгенерированы случайным образом 1000 правил
 
