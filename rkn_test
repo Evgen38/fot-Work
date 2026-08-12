@@ -1,0 +1,268 @@
+# ======================================================================
+# RKN Block Checker для PowerShell
+# Проверяет типы блокировок: DNS poisoning, TCP reset, TLS DPI, HTTP stub
+# ======================================================================
+
+# Целевые сайты (белый список - должны работать)
+$Whitelist = @(
+    @{name="gosuslugi"; url="https://www.gosuslugi.ru/"}
+    @{name="yandex"; url="https://yandex.ru/"}
+    @{name="sberbank"; url="https://www.sberbank.ru/"}
+    @{name="vk"; url="https://vk.com/"}
+    @{name="mail"; url="https://mail.ru/"}
+)
+
+# Целевые сайты (черный список - могут быть заблокированы)
+$Blacklist = @(
+    @{name="instagram"; url="https://www.instagram.com/"}
+    @{name="twitter"; url="https://twitter.com/"}
+    @{name="facebook"; url="https://www.facebook.com/"}
+    @{name="youtube"; url="https://www.youtube.com/"}
+    @{name="protonvpn"; url="https://protonvpn.com/"}
+    @{name="rutracker"; url="https://rutracker.org/"}
+    @{name="wikipedia"; url="https://www.wikipedia.org/"}
+)
+
+# DoH сервер (Cloudflare, не блокируется в РФ)
+$DoHServer = "https://cloudflare-dns.com/dns-query"
+
+# Строки-маркеры заглушек РКН
+$StubMarkers = @(
+    "доступ ограничен",
+    "blocked by rkn",
+    "на основании федерального закона",
+    "внесен в реестр",
+    "ограничение доступа"
+)
+
+# ======================================================================
+# Функции
+# ======================================================================
+
+function Get-MyPublicIP {
+    try {
+        $response = Invoke-RestMethod -Uri "https://api.ipify.org?format=json" -TimeoutSec 5
+        return $response.ip
+    } catch {
+        return "Unknown"
+    }
+}
+
+function Get-ISPInfo {
+    param($IP)
+    try {
+        $response = Invoke-RestMethod -Uri "http://ip-api.com/json/$IP" -TimeoutSec 5
+        if ($response.status -eq "success") {
+            return @{
+                org = $response.org
+                city = $response.city
+                country = $response.country
+            }
+        }
+    } catch {}
+    return @{org="Unknown"; city="Unknown"; country="Unknown"}
+}
+
+function Resolve-DNS {
+    param($Hostname)
+    
+    # Системный DNS
+    $sysIP = $null
+    try {
+        $sysIP = (Resolve-DnsName -Name $Hostname -ErrorAction Stop)[0].IPAddress
+    } catch {}
+    
+    # DoH (Cloudflare)
+    $dohIP = $null
+    try {
+        $body = @{name=$Hostname; type="A"} | ConvertTo-Json
+        $response = Invoke-RestMethod -Uri $DoHServer -Method POST -Body $body -ContentType "application/json" -TimeoutSec 5
+        if ($response.Answer) {
+            $dohIP = ($response.Answer | Where-Object {$_.type -eq 1}).data | Select-Object -First 1
+        }
+    } catch {}
+    
+    return @{
+        sys_ip = $sysIP
+        doh_ip = $dohIP
+        mismatch = ($sysIP -ne $dohIP) -and ($null -ne $sysIP) -and ($null -ne $dohIP)
+    }
+}
+
+function Test-TCPConnect {
+    param($IP, $Port = 443, $TimeoutMs = 3000)
+    
+    if (-not $IP) { return $false }
+    
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $result = $tcp.BeginConnect($IP, $Port, $null, $null)
+        $success = $result.AsyncWaitHandle.WaitOne($TimeoutMs)
+        if ($success) {
+            $tcp.EndConnect($result)
+            $tcp.Close()
+            return $true
+        }
+    } catch {}
+    return $false
+}
+
+function Test-TLSHandshake {
+    param($Hostname, $IP, $Port = 443, $TimeoutMs = 5000)
+    
+    if (-not $IP) { return $false }
+    
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $result = $tcp.BeginConnect($IP, $Port, $null, $null)
+        if (-not $result.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            return $false
+        }
+        $tcp.EndConnect($result)
+        
+        $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, {$true})
+        $ssl.BeginAuthenticateAsClient($Hostname, $null, $null)
+        $ssl.AuthenticateAsClient($Hostname)
+        $ssl.Close()
+        $tcp.Close()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-HTTPStub {
+    param($Url)
+    
+    try {
+        $response = Invoke-WebRequest -Uri $Url -Method GET -TimeoutSec 10 -UseBasicParsing
+        $body = $response.Content.ToLower()
+        
+        $isStub = $false
+        foreach ($marker in $StubMarkers) {
+            if ($body -match $marker) {
+                $isStub = $true
+                break
+            }
+        }
+        
+        return @{
+            status_code = $response.StatusCode
+            is_stub = $isStub
+        }
+    } catch {
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            return @{status_code = $statusCode; is_stub = $false}
+        }
+        return @{status_code = $null; is_stub = $false}
+    }
+}
+
+function Get-Verdict {
+    param($DNS, $TCP, $TLS, $HTTP, $IsStub)
+    
+    if (-not $DNS.doh_ip) { return "UNKNOWN", "No DNS resolution" }
+    if ($DNS.mismatch) { return "DNS_BLOCK", "DNS poisoning (system DNS differs from DoH)" }
+    if (-not $TCP) { return "TCP_RESET", "TCP handshake failed - possible IP block" }
+    if (-not $TLS) { return "TLS_BLOCK", "TLS handshake failed - DPI on SNI (typical RKN/TSPU)" }
+    if ($IsStub) { return "HTTP_STUB", "HTTP returns ISP stub page (blocked by RKN)" }
+    if ($HTTP.status_code -eq 451) { return "HTTP_451", "HTTP 451 Unavailable For Legal Reasons" }
+    return "OK", "Site is accessible"
+}
+
+# ======================================================================
+# Главная функция
+# ======================================================================
+
+function Invoke-RKNCheck {
+    Write-Host "======================================================================" -ForegroundColor Cyan
+    Write-Host "  RKN Block Checker for PowerShell" -ForegroundColor Cyan
+    Write-Host "======================================================================" -ForegroundColor Cyan
+    
+    # Информация о себе
+    $myIP = Get-MyPublicIP
+    $ispInfo = Get-ISPInfo -IP $myIP
+    
+    Write-Host "  IP:       $myIP" -ForegroundColor Yellow
+    Write-Host "  ISP:      $($ispInfo.org)" -ForegroundColor Yellow
+    Write-Host "  Location: $($ispInfo.city), $($ispInfo.country)" -ForegroundColor Yellow
+    Write-Host "----------------------------------------------------------------------" -ForegroundColor Gray
+    
+    # Белый список
+    Write-Host "`nWhitelist (should always work)" -ForegroundColor Green
+    Write-Host ("{0,-15} {1,-13} {2,-8} {3,-8} {4,-10} {5}" -f "name", "verdict", "TCP", "TLS", "HTTP", "status") -ForegroundColor Gray
+    Write-Host ("{0,-15} {1,-13} {2,-8} {3,-8} {4,-10} {5}" -f ("-"*15), ("-"*13), ("-"*8), ("-"*8), ("-"*10), "-") -ForegroundColor Gray
+    
+    foreach ($target in $Whitelist) {
+        $hostname = ([System.Uri]$target.url).Host
+        $dns = Resolve-DNS -Hostname $hostname
+        $tcp = Test-TCPConnect -IP $dns.doh_ip
+        $tls = if ($tcp) { Test-TLSHandshake -Hostname $hostname -IP $dns.doh_ip } else { $false }
+        $http = if ($tls) { Test-HTTPStub -Url $target.url } else { @{status_code = $null; is_stub = $false} }
+        $verdict, $note = Get-Verdict -DNS $dns -TCP $tcp -TLS $tls -HTTP $http -IsStub $http.is_stub
+        
+        $status = if ($http.status_code) { "$($http.status_code)" } else { "-" }
+        $tcpStr = if ($tcp) { "OK" } else { "-" }
+        $tlsStr = if ($tls) { "OK" } else { "-" }
+        
+        $verdictColor = if ($verdict -eq "OK") { "Green" } else { "Red" }
+        $verdictSymbol = if ($verdict -eq "OK") { "✓" } else { "✗" }
+        
+        Write-Host ("{0,-15} {1}{2,-12} {3,-8} {4,-8} {5,-10} {6}" -f $target.name, $verdictSymbol, $verdict, $tcpStr, $tlsStr, $status, "") -ForegroundColor $verdictColor
+        if ($note -and ($verdict -ne "OK")) {
+            Write-Host ("    └ $note") -ForegroundColor DarkGray
+        }
+    }
+    
+    # Черный список
+    Write-Host "`nBlacklist (RKN-restricted)" -ForegroundColor Red
+    Write-Host ("{0,-15} {1,-13} {2,-8} {3,-8} {4,-10} {5}" -f "name", "verdict", "TCP", "TLS", "HTTP", "status") -ForegroundColor Gray
+    Write-Host ("{0,-15} {1,-13} {2,-8} {3,-8} {4,-10} {5}" -f ("-"*15), ("-"*13), ("-"*8), ("-"*8), ("-"*10), "-") -ForegroundColor Gray
+    
+    $blockCount = 0
+    $totalCount = $Blacklist.Count
+    
+    foreach ($target in $Blacklist) {
+        $hostname = ([System.Uri]$target.url).Host
+        $dns = Resolve-DNS -Hostname $hostname
+        $tcp = Test-TCPConnect -IP $dns.doh_ip
+        $tls = if ($tcp) { Test-TLSHandshake -Hostname $hostname -IP $dns.doh_ip } else { $false }
+        $http = if ($tls) { Test-HTTPStub -Url $target.url } else { @{status_code = $null; is_stub = $false} }
+        $verdict, $note = Get-Verdict -DNS $dns -TCP $tcp -TLS $tls -HTTP $http -IsStub $http.is_stub
+        
+        $status = if ($http.status_code) { "$($http.status_code)" } else { "-" }
+        $tcpStr = if ($tcp) { "OK" } else { "-" }
+        $tlsStr = if ($tls) { "OK" } else { "-" }
+        
+        if ($verdict -ne "OK") { $blockCount++ }
+        
+        $verdictColor = if ($verdict -eq "OK") { "Green" } else { "Red" }
+        $verdictSymbol = if ($verdict -eq "OK") { "✓" } else { "✗" }
+        
+        Write-Host ("{0,-15} {1}{2,-12} {3,-8} {4,-8} {5,-10} {6}" -f $target.name, $verdictSymbol, $verdict, $tcpStr, $tlsStr, $status, "") -ForegroundColor $verdictColor
+        if ($note -and ($verdict -ne "OK")) {
+            Write-Host ("    └ $note") -ForegroundColor DarkGray
+        }
+    }
+    
+    # Итог
+    Write-Host "`n======================================================================" -ForegroundColor Cyan
+    Write-Host "  Summary" -ForegroundColor Cyan
+    Write-Host "----------------------------------------------------------------------" -ForegroundColor Gray
+    $open = $totalCount - $blockCount
+    Write-Host "  Whitelist: $($Whitelist.Count)/$($Whitelist.Count) working" -ForegroundColor Green
+    Write-Host "  Blacklist: $open/$totalCount open, $blockCount/$totalCount blocked" -ForegroundColor $([bool]$blockCount ? "Red" : "Green")
+    
+    if ($blockCount -gt 0) {
+        Write-Host "`n  → You ARE in an RKN-blocked zone." -ForegroundColor Red
+    } else {
+        Write-Host "`n  → You are NOT in an RKN-blocked zone." -ForegroundColor Green
+    }
+    Write-Host "======================================================================" -ForegroundColor Cyan
+}
+
+# ======================================================================
+# Запуск
+# ======================================================================
+Invoke-RKNCheck
